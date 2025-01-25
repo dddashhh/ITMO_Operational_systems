@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <sstream>
 #include <string>
@@ -20,7 +21,6 @@ void create_random_binary_file(const std::string& filename, size_t size) {
         throw std::runtime_error("Error opening file");
     }
 
-    std::vector<char> data(size);
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<> distrib(0, 255);
@@ -31,26 +31,6 @@ void create_random_binary_file(const std::string& filename, size_t size) {
 
     file.write(data.data(), data.size());
     file.close();
-}
-
-std::vector<char> read_binary_file(const std::string& filename) {
-    std::ifstream file(filename, std::ios::binary | std::ios::ate);
-    if (!file.is_open()) {
-        std::cerr << "Error opening file for reading: " << filename << std::endl;
-        throw std::runtime_error("Error opening file");
-    }
-    std::streamsize size = file.tellg();
-    file.seekg(0, std::ios::beg);
-
-    std::vector<char> buffer(size);
-    if (size > 0) {
-        if (!file.read(buffer.data(), size)) {
-            std::cerr << "Error reading from file: " << filename << std::endl;
-            throw std::runtime_error("Error reading from file");
-        }
-    }
-
-    return buffer;
 }
 
 void write_binary_file(const std::string& filename,
@@ -66,9 +46,12 @@ void write_binary_file(const std::string& filename,
 }
 
 void merge_sorted_chunks(const std::vector<std::string>& chunk_filenames,
-                         const std::string& output_filename) {
+                         const std::string& output_filename,
+                         size_t merge_chunk_size = 1024 * 1024) {
     std::vector<std::ifstream> chunk_files(chunk_filenames.size());
-    std::vector<char> current_elements(chunk_filenames.size());
+    std::vector<std::unique_ptr<char[]>> current_elements(chunk_filenames.size());
+    std::vector<size_t> current_element_sizes(chunk_filenames.size(), 0);
+    std::vector<size_t> current_element_offsets(chunk_filenames.size(), 0);
     std::vector<bool> eof_flags(chunk_filenames.size(), false);
 
     for (size_t i = 0; i < chunk_filenames.size(); ++i) {
@@ -78,9 +61,12 @@ void merge_sorted_chunks(const std::vector<std::string>& chunk_filenames,
                       << chunk_filenames[i] << std::endl;
             throw std::runtime_error("Error opening file");
         }
-
-        if (chunk_files[i].read(&current_elements[i], 1)) {
-        } else {
+        current_elements[i] = std::make_unique<char[]>(merge_chunk_size);
+        current_element_sizes[i] =
+                chunk_files[i]
+                        .read(current_elements[i].get(), merge_chunk_size)
+                        .gcount();
+        if (current_element_sizes[i] == 0) {
             eof_flags[i] = true;
         }
     }
@@ -98,9 +84,10 @@ void merge_sorted_chunks(const std::vector<std::string>& chunk_filenames,
 
         for (size_t i = 0; i < chunk_filenames.size(); ++i) {
             if (!eof_flags[i]) {
-                if (min_index == -1 || current_elements[i] < min_element) {
+                if (min_index == -1 ||
+                    current_elements[i][current_element_offsets[i]] < min_element) {
                     min_index = i;
-                    min_element = current_elements[i];
+                    min_element = current_elements[i][current_element_offsets[i]];
                 }
             }
         }
@@ -109,10 +96,17 @@ void merge_sorted_chunks(const std::vector<std::string>& chunk_filenames,
             break;
         }
         output_file.write(&min_element, 1);
-
-        if (chunk_files[min_index].read(&current_elements[min_index], 1)) {
-        } else {
-            eof_flags[min_index] = true;
+        current_element_offsets[min_index]++;
+        if (current_element_offsets[min_index] >=
+            current_element_sizes[min_index]) {
+            current_element_offsets[min_index] = 0;
+            current_element_sizes[min_index] =
+                    chunk_files[min_index]
+                            .read(current_elements[min_index].get(), merge_chunk_size)
+                            .gcount();
+            if (current_element_sizes[min_index] == 0) {
+                eof_flags[min_index] = true;
+            }
         }
     }
 
@@ -134,9 +128,8 @@ int main(int argc, char* argv[]) {
     int iterations = std::stoi(argv[1]);
     int file_size_mb = std::stoi(argv[2]);
     int chunk_size_mb = std::stoi(argv[3]);
-
-    size_t file_size = static_cast<size_t>(file_size_mb) * 1024 * 1024;
-    size_t chunk_size = static_cast<size_t>(chunk_size_mb) * 1024 * 1024;
+    long long file_size = static_cast<long long>(file_size_mb) * 1024 * 1024;
+    long long chunk_size = static_cast<long long>(chunk_size_mb) * 1024 * 1024;
 
     std::string input_filename = "input.bin";
     std::string output_filename = "test_output.bin";
@@ -153,32 +146,36 @@ int main(int argc, char* argv[]) {
         auto start_time = std::chrono::high_resolution_clock::now();
 
         create_random_binary_file(input_filename, file_size);
-        std::vector<char> data = read_binary_file(input_filename);
+        std::vector<std::string> chunk_filenames;
+        std::ifstream file(input_filename, std::ios::binary);
 
-        if (data.size() <= chunk_size) {
-            std::sort(data.begin(), data.end());
-            write_binary_file(output_filename, data);
+        if (!file.is_open()) {
+            std::cerr << "Error opening input file: " << input_filename << std::endl;
+            throw std::runtime_error("Error opening file");
+        }
+        size_t bytes_read = 0;
+        int chunk_index = 0;
+        while (bytes_read < file_size) {
+            std::string chunk_filename =
+                    "chunk_" + std::to_string(chunk_index++) + ".bin";
+            chunk_filenames.push_back(chunk_filename);
+            std::vector<char> buffer(chunk_size);
 
-        } else {
-            std::vector<std::string> chunk_filenames;
-            for (size_t j = 0; j < data.size(); j += chunk_size) {
-                size_t current_chunk_size = std::min(chunk_size, data.size() - j);
-                std::vector<char> chunk(data.begin() + j,
-                                        data.begin() + j + current_chunk_size);
-                std::sort(chunk.begin(), chunk.end());
+            size_t read_size = file.read(buffer.data(), chunk_size).gcount();
+            if (read_size > 0) {
+                std::sort(buffer.begin(), buffer.begin() + read_size);
+                write_binary_file(chunk_filename, buffer);
 
-                std::string chunk_filename = "temp_chunk_" + std::to_string(j) + ".bin";
-                write_binary_file(chunk_filename, chunk);
-                chunk_filenames.push_back(chunk_filename);
+            } else {
+                break;
             }
-            merge_sorted_chunks(chunk_filenames, "merged_output.bin");
-            std::vector<char> merged_data = read_binary_file("merged_output.bin");
-            write_binary_file(output_filename, merged_data);
+            bytes_read += read_size;
+        }
+        file.close();
+        merge_sorted_chunks(chunk_filenames, output_filename);
 
-            for (const auto& filename : chunk_filenames) {
-                remove(filename.c_str());
-            }
-            remove("merged_output.bin");
+        for (const auto& chunk_filename : chunk_filenames) {
+            fs::remove(chunk_filename);
         }
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
