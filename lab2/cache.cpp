@@ -7,7 +7,7 @@
 #include <cstdarg>
 #include <cstdlib>
 #include <unordered_map>
-#include "cache.h"
+#include "cache.hpp"
 
 
 typedef int (*open_func)(const char *pathname, int flags, ...);
